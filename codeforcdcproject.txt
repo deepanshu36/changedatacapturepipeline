@@ -1,0 +1,73 @@
+from awsglue.utils import getResolvedOptions
+import sys
+from pyspark.sql import SparkSession
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+
+job = Job(glueContext)
+
+
+args = getResolvedOptions(sys.argv, ['s3_target_path_key', 's3_target_path_bucket'])
+bucket = args['s3_target_path_bucket']
+fileName = args['s3_target_path_key']
+
+print(bucket, fileName)
+
+spark = SparkSession.builder.appName("CDC").getOrCreate()
+inputFilePath = f"s3a://{bucket}/{fileName}"
+finalFilePath = f"s3a://cdcoutputbucketpyspark/output"
+
+if "LOAD" in fileName:
+    loaddf = spark.read.format('csv').load(inputFilePath)
+    loaddf = loaddf.withColumnRenamed("_c0", "id").withColumnRenamed("_c1", "FullName") \
+        .withColumnRenamed("_c2", "City")
+    loaddf.show()
+    loaddf.write.mode("overwrite").csv(finalFilePath)
+else:
+    finaldf = spark.read.format('csv').load(finalFilePath)
+    finaldf = finaldf.withColumnRenamed("_c0", "id").withColumnRenamed("_c1", "FullName") \
+        .withColumnRenamed("_c2", "City")
+        
+    updatedf = spark.read.format('csv') \
+              .load(inputFilePath)
+    updatedf = updatedf.withColumnRenamed("_c0", "change").withColumnRenamed("_c1", "id") \
+              .withColumnRenamed("_c2", "Fullname") \
+              .withColumnRenamed("_c3", "City")    
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    path = f"s3://cdcoutputbucketpyspark/finalfile_{timestamp}/"
+
+    for row in updatedf.collect():
+        if row["change"] == "U":
+            updaterow = [list(row)[1:]]
+            lis = ['id', 'FullName', 'City']
+            update = spark.createDataFrame(updaterow, lis)
+            finaldf = finaldf.filter(finaldf["id"] != row["id"])
+            finaldf = finaldf.union(update.select("id", "FullName", "City"))
+
+        if row["change"] == "I":
+            insertrow = [list(row)[1:]]
+            lis = ['id', 'FullName', 'City']
+            addf = spark.createDataFrame(insertrow, lis)
+            finaldf = finaldf.union(addf.select("id", "FullName", "City"))
+
+        if row["change"] == "D":
+            finaldf = finaldf.filter(finaldf["id"] != row["id"])
+            
+    finaldf.coalesce(1).write.mode("overwrite").csv(path)
+    
+    tempdf=spark.read.format('csv').load(path)
+    tempdf=tempdf.dropDuplicates()
+    tempdf.coalesce(1).write.mode("overwrite").csv(finalFilePath)
+    glueContext.purge_s3_path(path, {"retentionPeriod": 0, "excludeStorageClasses": ["STANDARD_IA"]})
+
+    
+    
+
+    
